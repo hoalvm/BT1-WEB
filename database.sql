@@ -38,13 +38,13 @@ CREATE TABLE IF NOT EXISTS videos (
   COLLATE = utf8mb4_unicode_ci;
 
 INSERT IGNORE INTO categories (category_name, images, status) VALUES
-    ('Điện thoại', 'default.png', 1),
-    ('Laptop', 'default.png', 0),
-    ('Tablet', 'default.png', 1),
-    ('Smart Watch', 'default.png', 0),
-    ('Tai nghe', 'default.png', 1),
-    ('Camera', 'default.png', 0),
-    ('Tivi', 'default.png', 1),
-    ('Loa', 'default.png', 0),
-    ('Phụ kiện', 'default.png', 1),
+    ('Smartphones', 'default.png', 1),
+    ('Laptops', 'default.png', 0),
+    ('Tablets', 'default.png', 1),
+    ('Smartwatches', 'default.png', 0),
+    ('Headphones', 'default.png', 1),
+    ('Cameras', 'default.png', 0),
+    ('Televisions', 'default.png', 1),
+    ('Speakers', 'default.png', 0),
+    ('Accessories', 'default.png', 1),
     ('Gaming', 'default.png', 0);

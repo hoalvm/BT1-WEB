@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$TomcatServiceName = "Tomcat10",
-    [string]$UploadDirectory = "C:\ProgramData\JPAWeb\uploads"
+    [string]$UploadDirectory = ""
 )
 
 Set-StrictMode -Version Latest
@@ -18,22 +18,75 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Resolve-TomcatHome {
-    $candidates = @(
-        [Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine"),
-        $env:CATALINA_HOME,
-        "C:\Program Files\Apache Software Foundation\Tomcat 10.1"
-    ) | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) }
+function Invoke-ElevatedSelf {
+    $escapedScriptPath = $PSCommandPath.Replace("'", "''")
+    $command = "& '$escapedScriptPath'"
+    $encodedCommand = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($command)
+    )
+    $process = Start-Process -FilePath "powershell.exe" `
+        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand) `
+        -Verb RunAs `
+        -Wait `
+        -PassThru
+    exit $process.ExitCode
+}
 
-    foreach ($candidate in $candidates) {
-        $resolvedCandidate = [System.IO.Path]::GetFullPath($candidate.Trim())
-        if ((Test-Path -LiteralPath (Join-Path $resolvedCandidate "webapps") -PathType Container) -and
-            (Test-Path -LiteralPath (Join-Path $resolvedCandidate "bin") -PathType Container)) {
-            return $resolvedCandidate
-        }
+function Get-EnvironmentDirectory([string]$variableName, [bool]$required) {
+    $value = [Environment]::GetEnvironmentVariable($variableName, "Machine")
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $value = [Environment]::GetEnvironmentVariable($variableName, "User")
+    }
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $value = [Environment]::GetEnvironmentVariable($variableName, "Process")
     }
 
-    throw "Không tìm thấy Tomcat 10.1. Hãy cài Tomcat bằng Windows Service Installer trước."
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        if ($required) {
+            throw "Environment variable $variableName is not configured."
+        }
+        return $null
+    }
+
+    return [System.IO.Path]::GetFullPath($value.Trim())
+}
+
+function Test-JavaInstallation([string]$javaHome) {
+    $javaExecutable = Join-Path $javaHome "bin\java.exe"
+    $javacExecutable = Join-Path $javaHome "bin\javac.exe"
+    $releaseFile = Join-Path $javaHome "release"
+
+    if (-not (Test-Path -LiteralPath $javaExecutable -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $javacExecutable -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $releaseFile -PathType Leaf)) {
+        throw "JAVA_HOME does not point to a valid JDK: $javaHome"
+    }
+
+    $versionLine = Get-Content -LiteralPath $releaseFile | Where-Object { $_ -like "JAVA_VERSION=*" } | Select-Object -First 1
+    if (-not $versionLine -or $versionLine -notmatch 'JAVA_VERSION="([^"]+)"') {
+        throw "Unable to read the Java version from $releaseFile"
+    }
+
+    $version = $Matches[1]
+    $versionParts = $version.Split('.')
+    $majorVersion = if ($versionParts[0] -eq "1") { [int]$versionParts[1] } else { [int]$versionParts[0] }
+    if ($majorVersion -lt 17) {
+        throw "This project requires JDK 17 or newer, but JAVA_HOME points to Java $version."
+    }
+
+    $env:JAVA_HOME = $javaHome
+    $env:Path = (Join-Path $javaHome "bin") + ";" + $env:Path
+    return $version
+}
+
+function Resolve-TomcatHome {
+    $resolvedCandidate = Get-EnvironmentDirectory "CATALINA_HOME" $true
+    if ((Test-Path -LiteralPath (Join-Path $resolvedCandidate "bin\catalina.bat") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $resolvedCandidate "webapps") -PathType Container)) {
+        return $resolvedCandidate
+    }
+
+    throw "CATALINA_HOME does not point to a valid Tomcat installation: $resolvedCandidate"
 }
 
 function Resolve-MySqlClient {
@@ -52,7 +105,7 @@ function Resolve-MySqlClient {
         }
     }
 
-    throw "Không tìm thấy mysql.exe. Hãy cài MySQL Server 8.x trước."
+    throw "mysql.exe was not found. Install MySQL Server 8.x first."
 }
 
 function Initialize-Database([string]$mysqlClient) {
@@ -82,7 +135,7 @@ function Initialize-Database([string]$mysqlClient) {
     $process.WaitForExit()
 
     if ($process.ExitCode -ne 0) {
-        throw "Không thể khởi tạo database. MySQL trả về: $standardError"
+        throw "Database initialization failed. MySQL returned: $standardError"
     }
 
     if ($standardOutput) {
@@ -91,22 +144,39 @@ function Initialize-Database([string]$mysqlClient) {
 }
 
 if (-not (Test-Administrator)) {
-    throw "Hãy nhấp phải run.cmd và chọn Run as administrator."
+    Invoke-ElevatedSelf
 }
 
-if (-not (Get-Command "java.exe" -ErrorAction SilentlyContinue)) {
-    throw "Không tìm thấy Java. Hãy cài JDK 17 và mở lại terminal."
+foreach ($requiredCommand in @("git.exe", "mysql.exe")) {
+    if (-not (Get-Command $requiredCommand -ErrorAction SilentlyContinue)) {
+        throw "$requiredCommand was not found in PATH. Install it and open a new terminal."
+    }
 }
 
+$javaHome = Get-EnvironmentDirectory "JAVA_HOME" $true
+$javaVersion = Test-JavaInstallation $javaHome
 $tomcatHome = Resolve-TomcatHome
+$catalinaBase = Get-EnvironmentDirectory "CATALINA_BASE" $false
+if (-not $catalinaBase) {
+    $catalinaBase = $tomcatHome
+}
+if (-not (Test-Path -LiteralPath (Join-Path $catalinaBase "webapps") -PathType Container)) {
+    throw "CATALINA_BASE does not contain a webapps directory: $catalinaBase"
+}
+
 $tomcatService = Get-Service -Name $TomcatServiceName -ErrorAction SilentlyContinue
 if (-not $tomcatService) {
-    throw "Không tìm thấy Windows service '$TomcatServiceName'. Hãy cài Tomcat 10.1 bằng Windows Service Installer."
+    throw "Windows service '$TomcatServiceName' was not found. Install Tomcat 10.1 with the Windows Service Installer."
+}
+$serviceFilterName = $TomcatServiceName.Replace("'", "''")
+$tomcatServiceInfo = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceFilterName'"
+if (-not $tomcatServiceInfo) {
+    throw "Unable to read the configuration of Windows service '$TomcatServiceName'."
 }
 
 $mysqlServices = @(Get-Service | Where-Object { $_.Name -like "MySQL*" })
 if ($mysqlServices.Count -eq 0) {
-    throw "Không tìm thấy Windows service của MySQL."
+    throw "No MySQL Windows service was found."
 }
 $runningMySqlService = $mysqlServices | Where-Object { $_.Status -eq "Running" } | Select-Object -First 1
 if (-not $runningMySqlService) {
@@ -115,42 +185,62 @@ if (-not $runningMySqlService) {
     (Get-Service -Name $runningMySqlService.Name).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
 }
 
-[Environment]::SetEnvironmentVariable("CATALINA_HOME", $tomcatHome, "Machine")
+if ([string]::IsNullOrWhiteSpace($UploadDirectory)) {
+    $UploadDirectory = Get-EnvironmentDirectory "JPAWEB_UPLOAD_DIR" $false
+}
+if ([string]::IsNullOrWhiteSpace($UploadDirectory)) {
+    $UploadDirectory = "C:\ProgramData\JPAWeb\uploads"
+}
+$UploadDirectory = [System.IO.Path]::GetFullPath($UploadDirectory)
+
 [Environment]::SetEnvironmentVariable("JPAWEB_UPLOAD_DIR", $UploadDirectory, "Machine")
+$env:JAVA_HOME = $javaHome
 $env:CATALINA_HOME = $tomcatHome
+$env:CATALINA_BASE = $catalinaBase
 $env:JPAWEB_UPLOAD_DIR = $UploadDirectory
 
 New-Item -ItemType Directory -Force -Path $UploadDirectory | Out-Null
-& icacls.exe $UploadDirectory /grant "*S-1-5-19:(OI)(CI)M" /T /C | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "Không thể cấp quyền ghi thư mục upload cho Tomcat."
+$serviceAccount = $tomcatServiceInfo.StartName
+$aclIdentity = switch -Regex ($serviceAccount) {
+    '^(LocalSystem|NT AUTHORITY\\SYSTEM)$' { $null; break }
+    '^(NT AUTHORITY\\)?LocalService$' { "*S-1-5-19"; break }
+    '^(NT AUTHORITY\\)?NetworkService$' { "*S-1-5-20"; break }
+    default { $serviceAccount }
+}
+if ($aclIdentity) {
+    & icacls.exe $UploadDirectory /grant "${aclIdentity}:(OI)(CI)M" /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to grant upload-directory write access to Tomcat account '$serviceAccount'."
+    }
 }
 
-Write-Host "[1/4] Khởi tạo database jpa_web..."
+Write-Host "Preflight passed: Git, Java $javaVersion, MySQL, Tomcat, and environment variables are valid." -ForegroundColor Green
+
+Write-Host "[1/4] Initializing the jpa_web database..."
 Initialize-Database (Resolve-MySqlClient)
 
-Write-Host "[2/4] Build WAR bằng Maven Wrapper..."
+Write-Host "[2/4] Building the WAR with Maven Wrapper..."
 Push-Location $projectRoot
 try {
     & (Join-Path $projectRoot "mvnw.cmd") clean package
     if ($LASTEXITCODE -ne 0) {
-        throw "Maven build thất bại."
+        throw "Maven build failed."
     }
 } finally {
     Pop-Location
 }
 
-$webappsRoot = [System.IO.Path]::GetFullPath((Join-Path $tomcatHome "webapps"))
+$webappsRoot = [System.IO.Path]::GetFullPath((Join-Path $catalinaBase "webapps"))
 $deployedWar = [System.IO.Path]::GetFullPath((Join-Path $webappsRoot $warName))
 $explodedApplication = [System.IO.Path]::GetFullPath((Join-Path $webappsRoot "jpa-web-assignment-01"))
 $expectedPrefix = $webappsRoot.TrimEnd('\') + '\'
 
 if (-not $deployedWar.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
     -not $explodedApplication.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Đường dẫn deploy Tomcat không an toàn."
+    throw "The resolved Tomcat deployment path is unsafe."
 }
 
-Write-Host "[3/4] Deploy WAR và khởi động Tomcat..."
+Write-Host "[3/4] Deploying the WAR and starting Tomcat..."
 if ((Get-Service -Name $TomcatServiceName).Status -ne "Stopped") {
     Stop-Service -Name $TomcatServiceName -Force
     (Get-Service -Name $TomcatServiceName).WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
@@ -167,7 +257,7 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "target\$warName") -Destination $
 Start-Service -Name $TomcatServiceName
 (Get-Service -Name $TomcatServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
 
-Write-Host "[4/4] Kiểm tra ứng dụng..."
+Write-Host "[4/4] Checking the application..."
 $deadline = (Get-Date).AddSeconds(60)
 do {
     try {
@@ -182,4 +272,4 @@ do {
     }
 } while ((Get-Date) -lt $deadline)
 
-throw "Tomcat đã chạy nhưng ứng dụng chưa trả HTTP 200 sau 60 giây."
+throw "Tomcat is running, but the application did not return HTTP 200 within 60 seconds."
